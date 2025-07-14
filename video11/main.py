@@ -19,6 +19,8 @@ screen = pygame.display.set_mode((Config.WIDTH, Config.HEIGHT))
 # Set up the game clock to control frame rate
 clock = pygame.time.Clock()
 
+game_state = Config.GAME_STATE_PRESS_START
+
 # Create player and enemy instances
 player = Player()
 
@@ -210,91 +212,191 @@ while True:
     # Event handling
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
+            save_checkpoint(generation, best_score, enemy_ais)
             pygame.quit()
             exit()
+            
+        game_state = controller.handle_input_events(event, game_state)
+        
+    if game_state == Config.GAME_STATE_PRESS_START:
+        screen.fill(Config.BLUE)
+        draw_press_start(screen)
+        pygame.display.flip()
+        clock.tick(Config.FPS)
+        continue
+    
+    if game_state == Config.GAME_STATE_PAUSED:
+        draw_paused(screen)
+        pygame.display.flip()
+        clock.tick(Config.FPS)
+        continue
+    
+    current_time_ms = pygame.time.get_ticks()
+    current_time_sec = time.time()    
 
     # Check for key presses
     controller.update(player, bullets)
     
-    current_time = pygame.time.get_ticks()
+    player.x = max(0, min(player.x, Config.WIDTH - player.width))
+    player.y = max(0, player.y)
     
+    bullets_info = []
+    for bullet in bullets:
+        bullets_info.append({
+            'x': bullet.x,
+            'y': bullet.y,
+            'direction': bullet.direction,
+            'from_enemy': bullet.from_enemy
+        })
+        
+    platforms_info = []
+    for platform_rect in platform_handler.platforms:
+        platforms_info.append({
+            'x': platform_rect.x,
+            'y': platform_rect.y,
+            'width': platform_rect.width
+        })
+        
+    alive_enemies_count = 0
     for i, enemy in enumerate(enemies):
-        if enemy.health > 0 and current_time - enemy_last_shot[i] > 3000: # 3 seconds cooldown
-            bullet_x = enemy.x + (enemy.width / 2)
-            bullet_y = enemy.y + (enemy.height / 2)
-            bullet = Bullet(bullet_x, bullet_y)
-            bullet.direction = "left"
-            bullet.from_enemy = True
-            bullets.append(bullet)
-            enemy_last_shot[i] = current_time
-
-    # Update player physics
+        if enemy.health > 0:
+            alive_enemies_count += 1
+            
+            actions = enemy_ais[i].choose_action(player.x, player.y, enemy, bullets_info, platforms_info)
+            
+            if actions['move_left']:
+                enemy.x -= 3
+            if actions['move_right']:
+                enemy.x += 3
+                
+            if actions['jump'] and (current_time_ms - enemy_last_jump_time.get(enemy, 0) > 1000):
+                if enemy.jump():
+                    enemy_jumps_count[enemy] = enemy_jumps_count.get(enemy, 0) + 1
+                    enemy_last_jump_time[enemy] = current_time_ms
+                    
+            enemy.x = max(0, min(enemy.x, Config.WIDTH - enemy.width))
+            enemy.y = max(0, enemy.y)
+            
+            if actions['shoot'] and current_time_ms - enemy_last_shot[i] > 1000: # 1 second cooldown
+                bullet_x = enemy.x + (enemy.width / 2)
+                bullet_y = enemy.y + (enemy.height / 2)
+                bullet = Bullet(bullet_x, bullet_y, shooter_id=id(enemy))
+                
+                if player.x < enemy.x:
+                    bullet.direction = "left"
+                else:
+                    bullet.direction = "right"
+                bullet.from_enemy = True
+                bullets.append(bullet)
+                enemy_last_shot[i] = current_time_ms
+    
     player.update(platform_handler.platforms)
     
-    # Update bullets
+    for enemy in enemies:
+        enemy.update(platform_handler.platforms)
+        
+    bullets_to_remove = []
     for bullet in bullets:
         bullet.update()
         
+        if not (0<=bullet.x <= Config.WIDTH):
+            bullets_to_remove.append(bullet)
+            continue
+        
         if hasattr(bullet, "from_enemy") and bullet.from_enemy:
-            if (player.x < bullet.x < player.x + player.width or
-                player.x < bullet.x + bullet.width < player.x + player.width) and \
-                (player.y < bullet.y < player.y + player.height):
-                    player.health -= 10
-                    bullets.remove(bullet)
-                    continue
+            if player.rect.colliderect(pygame.Rect(bullet.x, bullet.y, bullet.width, bullet.height)):
+                player.health -= 10
+                if bullet.shooter_id in enemies:
+                    for enemy_instance in enemies:
+                        if id(enemy_instance) == bullet.shooter_id:
+                            enemy_damage_dealt[enemy_instance] = enemy_damage_dealt.get(enemy_instance, 0) + 10
+                            break
+                bullets_to_remove.append(bullet)
         else:
-            for enemy in enemies:
+            for i, enemy in enumerate(enemies):
                 if enemy.health > 0 and \
-                (enemy.x < bullet.x < enemy.x + enemy.width or
-                 enemy.x < bullet.x + bullet.width < enemy.x + enemy.width) and \
-                (enemy.y < bullet.y < enemy.y + enemy.height):
-                    enemy.health -= 10
-                    bullets.remove(bullet)
-                    break
-                
+                    pygame.Rect(bullet.x, bullet.y, bullet.width, bullet.height).colliderect(enemy.rect):
+                        enemy.health -= 25
+                        bullets_to_remove.append(bullet)
+                        enemy_damage_received[enemy] = enemy_damage_received.get(enemy, 0) + 10
+                        break
                     
-    # Remove inactive bullets
-    bullets = [b for b in bullets if 0 <= b.x <= Config.WIDTH]
+    bullets = [b for b in bullets if b not in bullets_to_remove]
     
-    # Clear the screen with a white background
-    screen.fill(Config.WHITE)
+    player_won_round = False
+    if alive_enemies_count == 0:
+        player_won_round = True
+        
+    if player.health <= 0 or alive_enemies_count == 0:
+        current_player_score = int(time.time() - score.start_time)
+        if current_player_score > best_score:
+            best_score = current_player_score
+            
+        for i, enemy_instance in enumerate(enemies):
+            time_survived = current_time_sec - enemy_start_times[i]
+            damage_dealt = enemy_damage_dealt.get(enemy_instance, 0)
+            damage_received = enemy_damage_received.get(enemy_instance, 0)
+            jumps_count = enemy_jumps_count.get(enemy_instance, 0)
+            
+            enemy_ais[i].calculate_fitness(
+                time_survived,
+                damage_dealt,
+                damage_received,
+                jumps_count
+            )
+        
+        evolved_ais = IA.evolve_population(enemy_ais, NUM_ENEMIES)
 
-    # Draw the ground
+        save_checkpoint(generation, best_score, evolved_ais)
+        
+        player = Player()  # Reset player
+        score = Score()  # Reset score
+        generation += 1
+        create_new_generation(evolved_ais)
+        platform_handler.generate_random_platforms()  # Reset platforms
+        bullets = []
+        game_state = Config.GAME_STATE_PRESS_START
+    
+    screen.fill(Config.BACKGROUND_COLOR)
+    
     pygame.draw.rect(screen, Config.BROWN, (0, Config.HEIGHT - Config.GROUND_HEIGHT, Config.WIDTH, Config.GROUND_HEIGHT))
     
-    # Draw the platform
     platform_handler.draw(screen)
-
-    # Draw the player
+    
     if player.health > 0:
         pygame.draw.rect(screen, Config.BLUE, (player.x, player.y, player.width, player.height))
     else:
         draw_game_over(screen)
-
-    for enemy in enemies:
+        game_state = Config.GAME_STATE_GAME_OVER
+        
+    for i, enemy in enumerate(enemies):
         if enemy.health > 0:
-            pygame.draw.rect(screen, Config.RED, (enemy.x, enemy.y, enemy.width, enemy.height))
+            pygame.draw.rect(screen, enemy_colors[i], (enemy.x, enemy.y, enemy.width, enemy.height))
             
             bar_width = enemy.width
             bar_height = 5
             health_ratio = enemy.health / 100
             bar_x = enemy.x
-            bar_y = enemy.y - bar_height - 2 # Position above the enemy
+            bar_y = enemy.y - bar_height - 2
             
-            # Draw health bar
             pygame.draw.rect(screen, Config.BLACK, (bar_x, bar_y, bar_width, bar_height))
-            
-            # Draw the health fill
             pygame.draw.rect(screen, Config.GREEN, (bar_x, bar_y, bar_width * health_ratio, bar_height))
             
-    
-    # Draw the bullets
     for bullet in bullets:
         bullet.draw(screen)
     
-    # Score
     score.update(screen, player)
-
+    
+    font = pygame.font.SysFont("Arial", 20)
+    generation_text = font.render(f"Generation: {generation}", True, Config.BLACK)
+    screen.blit(generation_text, (10, 60))
+    
+    best_score_text = font.render(f"Best Score: {best_score}", True, Config.BLACK)
+    screen.blit(best_score_text, (10, 80))
+    
+    alive_enemies_text = font.render(f"Alive Enemies: {alive_enemies_count}", True, Config.BLACK)
+    screen.blit(alive_enemies_text, (10, 100))
+    
     # Update the display
     pygame.display.flip()
 

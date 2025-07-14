@@ -54,7 +54,7 @@ class IA:
         sorted_platforms = sorted(platforms, key=lambda p: np.sqrt((enemy.x - p['x'])**2 + (enemy.y - p['y'])**2))
         platform_inputs = []
         
-        for i in range(min(len(sorted_platforms), self.max_num_platforms_considered)):
+        for i in range(min(len(sorted_platforms), self.max_num_platforms)):
             platform = sorted_platforms[i]
             platform_inputs.extend([
                 platform['x'] - enemy.x,
